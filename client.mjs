@@ -249,13 +249,14 @@ async function connectToServer() {
 async function listResources() {
     try {
         console.log('\n🔍 Listing available resources...');
-        
-        const resources = await client.listResources();
-        
+
+        const result = await client.listResources();
+        const resources = result.resources || [];
+
         console.log('\n✅ Resources retrieved successfully!');
         console.log('\n📋 Available Resources:');
         console.log('-------------------------------------------');
-        
+
         if (resources.length === 0) {
             console.log('No resources available.');
         } else {
@@ -265,7 +266,7 @@ async function listResources() {
                 console.log();
             });
         }
-        
+
         console.log('-------------------------------------------');
     } catch (err) {
         console.error('❌ Error listing resources:', err);
@@ -276,22 +277,32 @@ async function listResources() {
 async function listTools() {
     try {
         console.log('\n🔍 Listing available tools...');
-        
-        const tools = await client.listTools();
-        
+
+        const result = await client.listTools();
+        const tools = result.tools || [];
+
         console.log('\n✅ Tools retrieved successfully!');
         console.log('\n📋 Available Tools:');
         console.log('-------------------------------------------');
-        
+
         if (tools.length === 0) {
             console.log('No tools available.');
         } else {
             tools.forEach(tool => {
-                console.log(`🔧 ${tool.name}: ${tool.description || 'No description'}`);
+                console.log(`🔧 ${tool.name}`);
+                if (tool.description) {
+                    console.log(`   Description: ${tool.description}`);
+                }
+                if (tool.inputSchema && tool.inputSchema.properties) {
+                    const params = Object.keys(tool.inputSchema.properties);
+                    if (params.length > 0) {
+                        console.log(`   Parameters: ${params.join(', ')}`);
+                    }
+                }
                 console.log();
             });
         }
-        
+
         console.log('-------------------------------------------');
     } catch (err) {
         console.error('❌ Error listing tools:', err);
@@ -302,13 +313,14 @@ async function listTools() {
 async function listPrompts() {
     try {
         console.log('\n🔍 Listing available prompts...');
-        
-        const prompts = await client.listPrompts();
-        
+
+        const result = await client.listPrompts();
+        const prompts = result.prompts || [];
+
         console.log('\n✅ Prompts retrieved successfully!');
         console.log('\n📋 Available Prompts:');
         console.log('-------------------------------------------');
-        
+
         if (prompts.length === 0) {
             console.log('No prompts available.');
         } else {
@@ -317,7 +329,7 @@ async function listPrompts() {
                 console.log();
             });
         }
-        
+
         console.log('-------------------------------------------');
     } catch (err) {
         console.error('❌ Error listing prompts:', err);
