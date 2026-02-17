@@ -1181,15 +1181,7 @@ function registerDiscoverDatabaseTool(server, registerWithAlias) {
                     content: [{
                         type: "text",
                         text: markdown
-                }],
-                result: {
-                    databaseDiscovery: {
-                        tables: tablesResult.recordset || [],
-                        views: viewsResult.recordset || [],
-                        procedures: procsResult.recordset || [],
-                        functions: funcsResult.recordset || []
-                    }
-                }
+                    }]
                 };
             } catch (err) {
                 logger.error(`Error discovering database: ${err.message}`);

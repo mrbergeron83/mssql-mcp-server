@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  mssql-mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mssql-mcp-server
+    ports:
+      - "3333:3333"
+    environment:
+      # Server Configuration
+      PORT: 3333
+      TRANSPORT: sse
+      HOST: 0.0.0.0
+      PING_INTERVAL: 60000
+
+      # Database Configuration
+      DB_SERVER: ${DB_SERVER:-host.docker.internal}
+      DB_PORT: ${DB_PORT:-5252}
+      DB_DATABASE: ${DB_DATABASE:-master}
+      DB_USER: ${DB_USER:-sa}
+      DB_PASSWORD: ${DB_PASSWORD:-myComplexPass123!@}
+      DB_ENCRYPT: ${DB_ENCRYPT:-false}
+      DB_TRUST_SERVER_CERT: ${DB_TRUST_SERVER_CERT:-true}
+      DB_CONNECTION_TIMEOUT: ${DB_CONNECTION_TIMEOUT:-15000}
+      DB_REQUEST_TIMEOUT: ${DB_REQUEST_TIMEOUT:-15000}
+      DB_POOL_MAX: ${DB_POOL_MAX:-10}
+      DB_POOL_MIN: ${DB_POOL_MIN:-0}
+      DB_POOL_IDLE_TIMEOUT: ${DB_POOL_IDLE_TIMEOUT:-30000}
+
+      # Query Results Storage
+      QUERY_RESULTS_PATH: /usr/src/app/query_results
+
+      # Logging Configuration
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FILE: /usr/src/app/logs/mcp-server.log
+      LOG_MAX_SIZE: 10m
+      LOG_MAX_FILES: 5
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+
+      # Security Configuration
+      RATE_LIMIT_WINDOW_MS: 60000
+      RATE_LIMIT_MAX: 1000
+
+      # Client Configuration
+      MCP_SERVER_URL: http://localhost:3333
+
+    volumes:
+      # Persist query results
+      - ./query_results:/usr/src/app/query_results
+      # Persist logs
+      - ./logs:/usr/src/app/logs
+
+    restart: unless-stopped
+
+    # Connect to SQL Server running on the host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3333/', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

@@ -61,10 +61,10 @@ app.use(helmet({ contentSecurityPolicy: false })); // Modified helmet config for
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 
-// Rate limiting
+// Rate limiting - configurable via environment variables
 const limiter = rateLimit({
-    windowMs: 1 * 60 * 1000, // 1 minute
-    max: 100, // Limit each IP to 100 requests per minute
+    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 1 * 60 * 1000, // 1 minute default
+    max: parseInt(process.env.RATE_LIMIT_MAX) || 1000, // 1000 requests per window default
     standardHeaders: true,
     legacyHeaders: false,
     message: {
@@ -74,9 +74,13 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Logging middleware
+// Logging middleware - health checks at debug level, others at info
 app.use((req, res, next) => {
-    logger.info(`${req.method} ${req.url}`);
+    if (req.path === '/' || req.path === '/health') {
+        logger.debug(`${req.method} ${req.url}`);
+    } else {
+        logger.info(`${req.method} ${req.url}`);
+    }
     next();
 });
 
@@ -124,7 +128,9 @@ server.executeToolCall = async function (toolName, args) {
     }
 
     try {
-        logger.info(`Executing tool ${toolName} directly with args: ${JSON.stringify(args)}`);
+        if (logger.isLevelEnabled('debug')) {
+            logger.debug(`Executing tool ${toolName} directly with args: ${JSON.stringify(args)}`);
+        }
         const result = await tool.handler(args);
         logger.info(`Tool ${toolName} executed successfully`);
         return result;
@@ -139,10 +145,6 @@ try {
     // Register database tools (execute-query, table-details, etc.)
     logger.info("Registering database tools...");
     registerDatabaseTools(server);
-
-    // Debug log of registered tools
-    console.log("DEBUG: Tools after registration:");
-    console.log(Object.keys(server._tools || {}));
 
     // Register database resources (tables, schema, views, etc.)
     logger.info("Registering database resources...");
@@ -160,10 +162,15 @@ try {
     logger.error(error.stack);
 }
 
-// Transport variables
-let currentTransport = null;
-let activeConnections = new Set();
-let pingIntervalId = null;
+// Multi-session transport tracking
+// Maps sessionId -> { transport, pingInterval }
+const transports = new Map();
+
+// Captured onmessage handler from the first server.connect() call
+let capturedOnMessage = null;
+
+// Whether server.connect() has been called at least once (to set up SDK request handlers)
+let serverConnected = false;
 
 // Add HTTP server status endpoint
 app.get('/', (req, res) => {
@@ -184,7 +191,7 @@ app.get('/', (req, res) => {
         },
         connection_info: {
             ping_interval_ms: PING_INTERVAL,
-            active_connections: activeConnections.size
+            active_connections: transports.size
         },
         database_info: {
             server: dbConfig.server,
@@ -210,7 +217,6 @@ app.get('/tools', (req, res) => {
         });
 
         logger.info(`Tool listing requested. Found ${toolList.length} tools.`);
-        logger.info(`Tools from internal: ${Object.keys(tools).join(', ')}`);
 
         res.status(200).json({
             count: toolList.length,
@@ -228,7 +234,7 @@ app.get('/tools', (req, res) => {
     }
 });
 
-// Diagnostic endpoint 
+// Diagnostic endpoint
 app.get('/diagnostic', async (req, res) => {
     try {
         const dbConfig = getDbConfig(true); // Get sanitized config (no password)
@@ -243,11 +249,10 @@ app.get('/diagnostic', async (req, res) => {
             },
             mcp: {
                 transport: TRANSPORT,
-                activeConnections: activeConnections.size,
-                hasCurrentTransport: currentTransport !== null,
+                activeConnections: transports.size,
+                activeSessions: Array.from(transports.keys()),
                 version: server.options?.version || "1.1.0",
-                pingIntervalMs: PING_INTERVAL,
-                pingActive: pingIntervalId !== null
+                pingIntervalMs: PING_INTERVAL
             },
             database: {
                 server: dbConfig.server,
@@ -383,132 +388,87 @@ app.get('/sse', async (req, res) => {
         logger.info(`Creating SSE transport with messages endpoint: ${messagesEndpoint}`);
 
         // Create the transport
-        currentTransport = new SSEServerTransport(messagesEndpoint, res);
+        const transport = new SSEServerTransport(messagesEndpoint, res);
 
-        // Set up message handlers before connecting
-        currentTransport.onmessage = function (message) {
-            logger.info(`Transport received message: ${JSON.stringify(message)}`);
+        // Set up message handlers
+        transport.onmessage = function (message) {
+            if (logger.isLevelEnabled('debug')) {
+                logger.debug(`Transport received message: ${JSON.stringify(message)}`);
+            }
         };
 
         // Error handler
-        currentTransport.onerror = function (error) {
+        transport.onerror = function (error) {
             logger.error(`Transport error: ${error}`);
         };
 
         // Close handler
-        currentTransport.onclose = function () {
+        transport.onclose = function () {
             logger.info(`Transport closed`);
         };
 
-        // Connect the server to this transport
-        await server.connect(currentTransport);
+        if (!serverConnected) {
+            // First connection: full server.connect() to set up SDK request handlers
+            await server.connect(transport);
+            serverConnected = true;
 
-        logger.info('SSE transport connected successfully');
+            // Capture the onmessage handler the SDK installed for reuse on subsequent transports
+            capturedOnMessage = transport.onmessage;
+        } else {
+            // Subsequent connections: start transport manually and reuse SDK handlers
+            await transport.start();
 
-        // Add this connection to tracking
-        activeConnections.add(res);
-        logger.info(`Active SSE connections: ${activeConnections.size}`);
-
-        // Clear any existing ping interval
-        if (pingIntervalId) {
-            clearInterval(pingIntervalId);
+            // Assign the captured onmessage handler so the SDK processes requests on this transport
+            if (capturedOnMessage) {
+                transport.onmessage = capturedOnMessage;
+            }
         }
 
-        // Set up ping interval to keep connection alive
-        pingIntervalId = setInterval(() => {
+        // Store transport by sessionId
+        const sessionId = transport.sessionId;
+        logger.info(`SSE transport connected, sessionId: ${sessionId}`);
+
+        // Set up per-connection ping interval
+        const pingInterval = setInterval(() => {
             if (res && !res.finished) {
                 logger.debug('Sending ping to client');
                 res.write('event: ping\n');
                 res.write(`data: ${Date.now()}\n\n`);
             } else {
-                // Connection is closed, clear interval
-                clearInterval(pingIntervalId);
-                pingIntervalId = null;
+                clearInterval(pingInterval);
             }
         }, PING_INTERVAL);
 
+        // Store transport and its ping interval
+        transports.set(sessionId, { transport, pingInterval });
+        logger.info(`Active SSE connections: ${transports.size}`);
+
         // Handle client disconnect
         req.on('close', () => {
-            logger.info('SSE client disconnected');
-            activeConnections.delete(res);
-            currentTransport = null;
-
-            // Clear ping interval when client disconnects
-            if (pingIntervalId) {
-                clearInterval(pingIntervalId);
-                pingIntervalId = null;
+            logger.info(`SSE client disconnected, sessionId: ${sessionId}`);
+            const entry = transports.get(sessionId);
+            if (entry) {
+                clearInterval(entry.pingInterval);
+                transports.delete(sessionId);
             }
-
-            logger.info(`Active SSE connections: ${activeConnections.size}`);
+            logger.info(`Active SSE connections: ${transports.size}`);
         });
 
-        // Send a welcome message after connection is established
-        setTimeout(async () => {
-            try {
-                if (!currentTransport) return;
-
-                // Create a simple welcome notification
-                const welcomeMessage = {
-                    jsonrpc: "2.0",
-                    method: "notification",
-                    params: {
-                        type: "info",
-                        message: `# Welcome to MSSQL MCP Server v${server.options?.version || "1.1.0"} 🚀\n\n` +
-                            `To explore the database, use these commands:\n\n` +
-                            `\`\`\`javascript\n` +
-                            `mcp__discover_database()\n` +
-                            `\`\`\``
-                    }
-                };
-
-                currentTransport.send(welcomeMessage);
-                logger.info('Welcome message sent');
-
-                // Try to get a sample table for additional guidance
-                try {
-                    const tablesResult = await executeQuery(`
-                        SELECT TOP 1
-                            TABLE_NAME 
-                        FROM 
-                            INFORMATION_SCHEMA.TABLES 
-                        WHERE 
-                            TABLE_TYPE = 'BASE TABLE' 
-                        ORDER BY 
-                            TABLE_NAME
-                    `);
-
-                    if (tablesResult.recordset?.length > 0) {
-                        const sampleTable = tablesResult.recordset[0].TABLE_NAME;
-
-                        // Send additional examples
-                        const examplesMessage = {
-                            jsonrpc: "2.0",
-                            method: "notification",
-                            params: {
-                                type: "info",
-                                message: `## Example Commands\n\n` +
-                                    `Get table details:\n` +
-                                    `\`\`\`javascript\n` +
-                                    `mcp__table_details({ tableName: "${sampleTable}" })\n` +
-                                    `\`\`\`\n\n` +
-                                    `Execute a query:\n` +
-                                    `\`\`\`javascript\n` +
-                                    `mcp__execute_query({ sql: "SELECT TOP 10 * FROM ${sampleTable}" })\n` +
-                                    `\`\`\``
-                            }
-                        };
-
-                        currentTransport.send(examplesMessage);
-                    }
-                } catch (dbErr) {
-                    logger.warn(`Database query failed in welcome message: ${dbErr.message}`);
-                    // Continue without table example
+        // Send a welcome notification directly to this transport
+        try {
+            const welcomeMessage = {
+                jsonrpc: "2.0",
+                method: "notification",
+                params: {
+                    type: "info",
+                    message: `MSSQL MCP Server v${server.options?.version || "1.1.0"} ready. Use mcp__discover_database() to explore.`
                 }
-            } catch (err) {
-                logger.error(`Error sending welcome message: ${err.message}`);
-                // Don't terminate connection on welcome message error
-            }
-        }, 1000);
+            };
+            transport.send(welcomeMessage);
+            logger.info('Welcome message sent');
+        } catch (err) {
+            logger.warn(`Error sending welcome message: ${err.message}`);
+        }
     } catch (error) {
         logger.error(`Failed to set up SSE transport: ${error.message}`);
         res.status(500).end(`Error: ${error.message}`);
@@ -516,28 +476,43 @@ app.get('/sse', async (req, res) => {
 });
 
 // Messages endpoint for client to send messages
-app.post('/messages', (req, res) => {
-    logger.info('Received message from client');
+app.post('/messages', async (req, res) => {
+    // Extract sessionId from query string
+    const sessionId = req.query.sessionId;
+    if (!sessionId) {
+        return res.status(400).json({
+            jsonrpc: "2.0",
+            id: req.body.id || null,
+            error: {
+                code: -32000,
+                message: "Missing sessionId query parameter. Connect to /sse endpoint first."
+            }
+        });
+    }
 
-    if (!currentTransport) {
-        logger.error('No SSE transport available to process message');
+    const entry = transports.get(sessionId);
+    if (!entry) {
         return res.status(503).json({
             jsonrpc: "2.0",
             id: req.body.id || null,
             error: {
                 code: -32000,
-                message: "Server transport not initialized. Connect to /sse endpoint first."
+                message: `No active transport for sessionId: ${sessionId}. Connect to /sse endpoint first.`
             }
         });
     }
+
+    const transport = entry.transport;
 
     try {
         // Extract the request ID for better debugging
         const requestId = req.body.id || "unknown";
         const method = req.body.method || "unknown";
 
-        logger.info(`Processing message ID: ${requestId}, method: ${method}`);
-        logger.info(`Request body: ${JSON.stringify(req.body)}`);
+        logger.info(`Processing message ID: ${requestId}, method: ${method}, session: ${sessionId}`);
+        if (logger.isLevelEnabled('debug')) {
+            logger.debug(`Request body: ${JSON.stringify(req.body)}`);
+        }
 
         // Special handling for cursor guide tool
         if (method === 'tools/call' &&
@@ -621,29 +596,18 @@ const prevPage = await tool.call("mcp_paginated_query", {
                 }]
             };
 
-            // Don't send response via HTTP, just SSE which is what Claude expects
-            // Also send via SSE for any listeners
-            if (currentTransport) {
-                // Proper JSON-RPC formatting is critical
+            // Send via SSE transport
+            if (transport.res && !transport.res.finished) {
                 const sseResponse = {
                     jsonrpc: "2.0",
                     id: requestId,
                     result: result
                 };
 
-                // Write direct to the SSE connection with event: message format
-                if (currentTransport.res && !currentTransport.res.finished) {
-                    currentTransport.res.write(`event: message\n`);
-                    currentTransport.res.write(`data: ${JSON.stringify(sseResponse)}\n\n`);
-
-                    // Send a success response to the HTTP POST
-                    res.status(200).json({ success: true });
-                } else {
-                    // If SSE connection is closed, fallback to HTTP response
-                    res.status(200).json(sseResponse);
-                }
+                transport.res.write(`event: message\n`);
+                transport.res.write(`data: ${JSON.stringify(sseResponse)}\n\n`);
+                res.status(200).json({ success: true });
             } else {
-                // Fallback to HTTP response if no SSE transport
                 res.status(200).json({
                     jsonrpc: "2.0",
                     id: requestId,
@@ -652,6 +616,182 @@ const prevPage = await tool.call("mcp_paginated_query", {
             }
 
             return;
+        }
+
+        // Special handling for resources/read requests
+        if (method === 'resources/read') {
+            const uri = req.body.params?.uri;
+
+            logger.info(`Direct handling for resource read: ${uri}`);
+
+            try {
+                if (uri === 'schema://database') {
+                    const result = await executeQuery(`
+                        SELECT
+                            TABLE_NAME,
+                            COLUMN_NAME,
+                            DATA_TYPE,
+                            IS_NULLABLE,
+                            CHARACTER_MAXIMUM_LENGTH,
+                            COLUMN_DEFAULT
+                        FROM
+                            INFORMATION_SCHEMA.COLUMNS
+                        ORDER BY
+                            TABLE_NAME, ORDINAL_POSITION
+                    `);
+
+                    // Format schema data
+                    const tables = {};
+                    result.recordset.forEach(record => {
+                        if (!tables[record.TABLE_NAME]) {
+                            tables[record.TABLE_NAME] = [];
+                        }
+                        tables[record.TABLE_NAME].push({
+                            name: record.COLUMN_NAME,
+                            type: record.DATA_TYPE,
+                            length: record.CHARACTER_MAXIMUM_LENGTH,
+                            nullable: record.IS_NULLABLE === 'YES',
+                            default: record.COLUMN_DEFAULT
+                        });
+                    });
+
+                    // Format as markdown
+                    let output = '# Database Schema\n\n';
+                    for (const [tableName, columns] of Object.entries(tables)) {
+                        output += `## Table: ${tableName}\n\n`;
+                        output += '| Column | Type | Length | Nullable | Default |\n';
+                        output += '|--------|------|--------|----------|--------|\n';
+
+                        columns.forEach(col => {
+                            const length = col.length !== null ? col.length : 'N/A';
+                            const defaultVal = col.default !== null ? col.default : 'N/A';
+                            output += `| ${col.name} | ${col.type} | ${length} | ${col.nullable ? 'Yes' : 'No'} | ${defaultVal} |\n`;
+                        });
+
+                        output += '\n';
+                    }
+
+                    const resourceResult = {
+                        contents: [{
+                            uri: uri,
+                            mimeType: "text/plain",
+                            text: output
+                        }]
+                    };
+
+                    // Send result via SSE transport
+                    if (transport.res && !transport.res.finished) {
+                        const sseResponse = {
+                            jsonrpc: "2.0",
+                            id: requestId,
+                            result: resourceResult
+                        };
+
+                        transport.res.write(`event: message\n`);
+                        transport.res.write(`data: ${JSON.stringify(sseResponse)}\n\n`);
+                        res.status(200).json({ success: true });
+                    } else {
+                        res.status(200).json({
+                            jsonrpc: "2.0",
+                            id: requestId,
+                            result: resourceResult
+                        });
+                    }
+
+                    return;
+                } else if (uri === 'tables://list') {
+                    const result = await executeQuery(`
+                        SELECT
+                            TABLE_SCHEMA,
+                            TABLE_NAME,
+                            TABLE_TYPE
+                        FROM
+                            INFORMATION_SCHEMA.TABLES
+                        WHERE
+                            TABLE_TYPE = 'BASE TABLE'
+                        ORDER BY
+                            TABLE_SCHEMA, TABLE_NAME
+                    `);
+
+                    // Format as markdown
+                    let markdown = `# Database Tables\n\n`;
+                    const tablesBySchema = {};
+                    result.recordset.forEach(table => {
+                        if (!tablesBySchema[table.TABLE_SCHEMA]) {
+                            tablesBySchema[table.TABLE_SCHEMA] = [];
+                        }
+                        tablesBySchema[table.TABLE_SCHEMA].push(table.TABLE_NAME);
+                    });
+
+                    for (const [schema, tables] of Object.entries(tablesBySchema)) {
+                        markdown += `## ${schema} Schema\n\n`;
+                        tables.forEach(table => {
+                            markdown += `- ${table}\n`;
+                        });
+                        markdown += '\n';
+                    }
+
+                    const resourceResult = {
+                        contents: [{
+                            uri: uri,
+                            mimeType: "text/plain",
+                            text: markdown
+                        }]
+                    };
+
+                    // Send result via SSE transport
+                    if (transport.res && !transport.res.finished) {
+                        const sseResponse = {
+                            jsonrpc: "2.0",
+                            id: requestId,
+                            result: resourceResult
+                        };
+
+                        transport.res.write(`event: message\n`);
+                        transport.res.write(`data: ${JSON.stringify(sseResponse)}\n\n`);
+                        res.status(200).json({ success: true });
+                    } else {
+                        res.status(200).json({
+                            jsonrpc: "2.0",
+                            id: requestId,
+                            result: resourceResult
+                        });
+                    }
+
+                    return;
+                } else {
+                    throw new Error(`Resource not found: ${uri}`);
+                }
+            } catch (err) {
+                logger.error(`Error reading resource: ${err.message}`);
+
+                // Send error via SSE
+                if (transport.res && !transport.res.finished) {
+                    const errorResponse = {
+                        jsonrpc: "2.0",
+                        id: requestId,
+                        error: {
+                            code: -32603,
+                            message: `Error reading resource: ${err.message}`
+                        }
+                    };
+
+                    transport.res.write(`event: message\n`);
+                    transport.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
+                    res.status(200).json({ success: true });
+                } else {
+                    res.status(500).json({
+                        jsonrpc: "2.0",
+                        id: requestId,
+                        error: {
+                            code: -32603,
+                            message: `Error reading resource: ${err.message}`
+                        }
+                    });
+                }
+
+                return;
+            }
         }
 
         // Special handling for tool calls - properly send via SSE transport
@@ -687,22 +827,17 @@ const prevPage = await tool.call("mcp_paginated_query", {
                         logger.info(`Direct tool result obtained successfully`);
 
                         // Send result via SSE transport
-                        if (currentTransport && currentTransport.res && !currentTransport.res.finished) {
-                            // Proper JSON-RPC formatting
+                        if (transport.res && !transport.res.finished) {
                             const sseResponse = {
                                 jsonrpc: "2.0",
                                 id: requestId,
                                 result: result
                             };
 
-                            // Write directly to the SSE connection with event: message format
-                            currentTransport.res.write(`event: message\n`);
-                            currentTransport.res.write(`data: ${JSON.stringify(sseResponse)}\n\n`);
-
-                            // Respond to HTTP request
+                            transport.res.write(`event: message\n`);
+                            transport.res.write(`data: ${JSON.stringify(sseResponse)}\n\n`);
                             res.status(200).json({ success: true });
                         } else {
-                            // Fallback to HTTP response if SSE not available
                             res.status(200).json({
                                 jsonrpc: "2.0",
                                 id: requestId,
@@ -714,7 +849,7 @@ const prevPage = await tool.call("mcp_paginated_query", {
                         logger.error(`Error executing tool directly: ${err.message}`);
 
                         // Send error via SSE
-                        if (currentTransport && currentTransport.res && !currentTransport.res.finished) {
+                        if (transport.res && !transport.res.finished) {
                             const errorResponse = {
                                 jsonrpc: "2.0",
                                 id: requestId,
@@ -724,9 +859,8 @@ const prevPage = await tool.call("mcp_paginated_query", {
                                 }
                             };
 
-                            currentTransport.res.write(`event: message\n`);
-                            currentTransport.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
-
+                            transport.res.write(`event: message\n`);
+                            transport.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
                             res.status(200).json({ success: true });
                         } else {
                             res.status(500).json({
@@ -747,7 +881,7 @@ const prevPage = await tool.call("mcp_paginated_query", {
                 logger.error(`Available tools: ${Object.keys(server._tools || {}).join(', ')}`);
 
                 // Send error via SSE
-                if (currentTransport && currentTransport.res && !currentTransport.res.finished) {
+                if (transport.res && !transport.res.finished) {
                     const errorResponse = {
                         jsonrpc: "2.0",
                         id: requestId,
@@ -757,9 +891,8 @@ const prevPage = await tool.call("mcp_paginated_query", {
                         }
                     };
 
-                    currentTransport.res.write(`event: message\n`);
-                    currentTransport.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
-
+                    transport.res.write(`event: message\n`);
+                    transport.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
                     res.status(200).json({ success: true });
                 } else {
                     return res.status(404).json({
@@ -775,41 +908,22 @@ const prevPage = await tool.call("mcp_paginated_query", {
             }
         }
 
-        // Special case for SSEServerTransport - monkey patch its send method to ensure correct format
-        // This affects all other tool calls that go through the standard transport
-        if (currentTransport && typeof currentTransport.send === 'function') {
-            const originalSend = currentTransport.send;
-            currentTransport.send = function (message) {
-                logger.info(`Intercepting SSE transport send: ${JSON.stringify(message)}`);
-
-                // Don't use the original send for JSON-RPC responses, write directly to the stream
-                if (message.jsonrpc === "2.0" && message.id && (message.result || message.error)) {
-                    if (this.res && !this.res.finished) {
-                        // Write the message with event: message format as per GitHub reference
-                        this.res.write(`event: message\n`);
-                        this.res.write(`data: ${JSON.stringify(message)}\n\n`);
-
-                        // No need for separate completion event with this format
-                        logger.info(`Sent message event for request ID: ${message.id}`);
-                        return;
-                    }
-                }
-
-                // Fall back to original behavior for other messages
-                return originalSend.call(this, message);
-            };
+        // For non-tool messages (initialize, tools/list, etc.):
+        // Temporarily set the SDK's internal transport so responses route to the correct SSE stream.
+        // This is safe because these handlers resolve synchronously in single-threaded Node.js.
+        if (server.server && server.server._transport !== undefined) {
+            server.server._transport = transport;
         }
 
-        // For standard message handling (non-tool calls or tools we couldn't handle directly)
-        // Let the SSEServerTransport handle it with our monkey-patched send method
-        currentTransport.handlePostMessage(req, res, req.body);
+        // Let the SSEServerTransport handle it via the SDK's standard path
+        transport.handlePostMessage(req, res, req.body);
         logger.info(`Message processed via SSE transport for request ID: ${requestId}`);
 
     } catch (error) {
         logger.error(`Error processing message: ${error.message}`);
 
         // Send error via SSE if possible
-        if (currentTransport && currentTransport.res && !currentTransport.res.finished) {
+        if (transport.res && !transport.res.finished) {
             const errorResponse = {
                 jsonrpc: "2.0",
                 id: req.body.id || null,
@@ -819,9 +933,8 @@ const prevPage = await tool.call("mcp_paginated_query", {
                 }
             };
 
-            currentTransport.res.write(`event: message\n`);
-            currentTransport.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
-
+            transport.res.write(`event: message\n`);
+            transport.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
             res.status(200).json({ success: true });
         } else {
             return res.status(500).json({
@@ -1127,24 +1240,20 @@ async function startServer() {
         process.on('SIGINT', async () => {
             logger.info('Shutting down server gracefully...');
 
-            // Clear ping interval if it exists
-            if (pingIntervalId) {
-                logger.info('Clearing ping interval');
-                clearInterval(pingIntervalId);
-                pingIntervalId = null;
-            }
-
-            // Close active connections
-            if (activeConnections.size > 0) {
-                logger.info(`Closing ${activeConnections.size} active SSE connections`);
-                for (const connection of activeConnections) {
+            // Close all active transports and clear their ping intervals
+            if (transports.size > 0) {
+                logger.info(`Closing ${transports.size} active SSE connections`);
+                for (const [sessionId, entry] of transports) {
                     try {
-                        connection.end();
+                        clearInterval(entry.pingInterval);
+                        if (entry.transport.res && !entry.transport.res.finished) {
+                            entry.transport.res.end();
+                        }
                     } catch (error) {
-                        logger.error(`Error closing SSE connection: ${error.message}`);
+                        logger.error(`Error closing SSE connection ${sessionId}: ${error.message}`);
                     }
                 }
-                activeConnections.clear();
+                transports.clear();
             }
 
             // Close HTTP server if it's running
